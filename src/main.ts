@@ -16,7 +16,9 @@ interface PrivateAdapter {
 	getFullRealPath(realPath: string): string;
 	getRealPath(path: string): string;
 	listRecursive(path: string): Promise<void>;
+	listRecursiveChild(parent: string, name: string): Promise<void>;
 	reconcileDeletion(realPath: string, path: string): Promise<void>;
+	reconcileFile?(e: string, t: string, silent?: boolean): Promise<void>;
 	reconcileFileInternal?(realPath: string, path: string): Promise<void>;
 	reconcileFolderCreation(realPath: string, path: string): Promise<void>;
 }
@@ -51,6 +53,12 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 	private previousShowUnsupportedFiles = false;
 	private originalReconcileDeletion:
 		| PrivateAdapter["reconcileDeletion"]
+		| null = null;
+	private originalListRecursiveChild:
+		| PrivateAdapter["listRecursiveChild"]
+		| null = null;
+	private originalReconcileFile:
+		| PrivateAdapter["reconcileFile"]
 		| null = null;
 	private originalI18nT: ((...args: unknown[]) => string) | null = null;
 	private hiddenPaths = new Set<string>();
@@ -116,38 +124,87 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		if (this.originalReconcileDeletion) return; // already patched
 		this.originalReconcileDeletion =
 			adapter.reconcileDeletion.bind(adapter);
+		this.originalListRecursiveChild =
+			adapter.listRecursiveChild.bind(adapter);
+		if (adapter.reconcileFile) {
+			this.originalReconcileFile = adapter.reconcileFile.bind(adapter);
+		}
 
 		const origReconcileDeletion = this.originalReconcileDeletion;
+		const origListRecursiveChild = this.originalListRecursiveChild;
+		const origReconcileFile = this.originalReconcileFile;
 
 		adapter.reconcileDeletion = async (
 			realPath: string,
 			path: string,
 		) => {
-			if (
-				this.settings.showHiddenFiles &&
-				isHiddenPath(path, this.app.vault.configDir)
-			) {
-				// File exists on disk — re-register it instead of deleting
-				const fullPath = adapter.getFullPath(path);
-				if (await adapter._exists(fullPath, path)) {
-					this.hiddenPaths.add(path);
-					await this.showFile(path);
-					return;
-				}
-				this.hiddenPaths.delete(path);
-			}
+			if (await this.maybeReveal(path)) return;
+			// Path no longer exists on disk (or is not hidden) — remove it.
+			this.hiddenPaths.delete(path);
 			return origReconcileDeletion(realPath, path);
 		};
+
+		// Key recursion fix: Obsidian's folder walker applies the hidden filter
+		// in listRecursiveChild and never descends into hidden folders, so only
+		// top-level dotfiles were ever visited. Re-register hidden children so
+		// the walk continues recursively into them at any depth.
+		adapter.listRecursiveChild = async (
+			parent: string,
+			name: string,
+		) => {
+			const path = parent === "" ? name : `${parent}/${name}`;
+			if (await this.maybeReveal(path)) return;
+			return origListRecursiveChild(parent, name);
+		};
+
+		// Keep live fs events (create/edit) on hidden files working.
+		if (origReconcileFile) {
+			adapter.reconcileFile = async (
+				e: string,
+				t: string,
+				silent?: boolean,
+			) => {
+				if (await this.maybeReveal(t)) return;
+				this.hiddenPaths.delete(t);
+				return origReconcileFile(e, t, silent);
+			};
+		}
+	}
+
+	/** Register a hidden path with the vault if it exists on disk. Returns true if revealed. */
+	private async maybeReveal(path: string): Promise<boolean> {
+		const adapter = this.adapter();
+		if (!this.settings.showHiddenFiles) return false;
+		if (!isHiddenPath(path, this.app.vault.configDir)) return false;
+		const fullPath = adapter.getFullPath(path);
+		if (!(await adapter._exists(fullPath, path))) return false;
+		this.hiddenPaths.add(path);
+		await this.showFile(path);
+		return true;
 	}
 
 	private async restoreAdapter(): Promise<void> {
 		if (this.originalReconcileDeletion) {
 			const adapter = this.adapter();
-			adapter.reconcileDeletion = this.originalReconcileDeletion;
-			this.originalReconcileDeletion = null;
 
-			// Hide all files we previously revealed
-			for (const path of this.hiddenPaths) {
+			// Restore originals first so the cleanup below removes, not re-reveals.
+			adapter.reconcileDeletion = this.originalReconcileDeletion;
+			if (this.originalListRecursiveChild) {
+				adapter.listRecursiveChild = this.originalListRecursiveChild;
+			}
+			if (this.originalReconcileFile) {
+				adapter.reconcileFile = this.originalReconcileFile;
+			}
+			this.originalReconcileDeletion = null;
+			this.originalListRecursiveChild = null;
+			this.originalReconcileFile = null;
+
+			// Hide all files we previously revealed — deepest first so folders
+			// are emptied before they are removed.
+			const paths = [...this.hiddenPaths].sort(
+				(a, b) => b.length - a.length,
+			);
+			for (const path of paths) {
 				await adapter.reconcileDeletion(adapter.getRealPath(path), path);
 			}
 			this.hiddenPaths.clear();
@@ -189,8 +246,10 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 
 	/** Disable hidden files — hide all revealed files + restore. */
 	async disableHiddenFiles(): Promise<void> {
-		// Hide all currently visible dotfiles before restoring
-		for (const path of this.hiddenPaths) {
+		// Hide all currently visible dotfiles — deepest first so folders are
+		// emptied before they are removed.
+		const paths = [...this.hiddenPaths].sort((a, b) => b.length - a.length);
+		for (const path of paths) {
 			await this.hideFile(path);
 		}
 		this.hiddenPaths.clear();

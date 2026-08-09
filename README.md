@@ -61,7 +61,7 @@ npm run dev
 ## How it works
 
 - **Show all file types** uses Obsidian's internal `vault.setConfig('showUnsupportedFiles', …)` API to toggle the native setting programmatically.
-- **Show hidden files** intercepts the vault adapter's `reconcileDeletion` method — when Obsidian tries to hide a dotfile, the plugin re-registers it instead. A full vault rescan via `listRecursive` triggers discovery of all dotfiles on startup.
+- **Show hidden files** intercepts the vault adapter's `reconcileDeletion` and `listRecursiveChild` methods — when Obsidian tries to hide a dotfile or dotfolder, the plugin re-registers it instead. Patching the recursive walker (`listRecursiveChild`) makes hidden folders at any depth — not just one level below the vault root — get traversed and revealed. A full vault rescan via `listRecursive` triggers discovery of all dotfiles on startup.
 - On disable, both settings are restored to their previous values and all revealed dotfiles are hidden again.
 
 ## Compatibility
