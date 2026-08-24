@@ -15,6 +15,7 @@ interface PrivateAdapter {
 	getFullPath(path: string): string;
 	getFullRealPath(realPath: string): string;
 	getRealPath(path: string): string;
+	list(path: string): Promise<{ files: string[]; folders: string[] }>;
 	listRecursive(path: string): Promise<void>;
 	listRecursiveChild(parent: string, name: string): Promise<void>;
 	reconcileDeletion(realPath: string, path: string): Promise<void>;
@@ -232,9 +233,21 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		}
 	}
 
-	/** Trigger a full vault rescan so all dotfiles hit our patched reconcileDeletion. */
+	/** Trigger a full vault rescan so all dotfiles hit our patched adapter methods. */
 	private async rescanVault(): Promise<void> {
-		await this.adapter().listRecursive("");
+		const adapter = this.adapter();
+		await adapter.listRecursive("");
+		// listRecursive("") only reconciles top-level entries — hidden folders
+		// nested under already-registered folders are never visited, so only
+		// root-level dotfiles were revealed. Force a subtree walk for every
+		// top-level folder so the patched listRecursiveChild fires for hidden
+		// paths at any depth. (.obsidian/.trash remain excluded by isHiddenPath.)
+		const configDir = this.app.vault.configDir;
+		const { folders } = await adapter.list("");
+		for (const folder of folders) {
+			if (folder === configDir || ALWAYS_EXCLUDED.has(folder)) continue;
+			await adapter.listRecursive(folder);
+		}
 	}
 
 	/** Enable hidden files — patch + rescan. */
