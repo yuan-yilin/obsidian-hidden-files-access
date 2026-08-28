@@ -478,16 +478,32 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 			}
 		};
 
-		// 指定项列表：文本框放在描述下方（info 列）占满整行宽度——
-		// Setting 默认的右侧控件列太窄，多行文本框会被挤成一条竖线。
+		// 指定项列表：保存按钮放在行右上角（与「隐藏项过滤模式」行的控件
+		// 位置一致，align-self 让按钮不被下方的高文本框顶到垂直居中）；
+		// 文本框放在描述下方占满整行宽度——Setting 默认的右侧控件列太窄，
+		// 多行文本框会被挤成一条竖线。
 		const listSetting = new Setting(containerEl)
 			.setName("指定项列表")
 			.setDesc(
-				"每行一项：写名称（如 .git，匹配任意层级的同名项）或写路径" +
-					"（如 call-match-loop-engineering/.claude，匹配该路径及其内部所有内容）。" +
+				"多个条目之间用换行分隔（每行一项）。" +
+					"每项可写名称（如 .git，匹配任意层级的同名项）" +
+					"或写路径（如 call-match-loop-engineering/.claude，匹配该路径及其内部所有内容）。" +
 					"仅显示模式下会自动放行列表条目的父级路径。" +
 					"Obsidian 配置目录与 .trash 回收站始终不会显示。",
-			);
+			)
+			.addButton((btn) => {
+				applyButton = btn;
+				btn.setButtonText("保存列表并重新扫描")
+					.setDisabled(true)
+					.onClick(async () => {
+						await this.plugin.updateFilterList(listDraft);
+						await this.plugin.reapplyFilter();
+						new Notice("隐藏项过滤列表已应用");
+						refreshApplyState();
+					});
+			});
+		listSetting.controlEl.setCssStyles({ alignSelf: "flex-start" });
+
 		const listInput = new TextAreaComponent(listSetting.infoEl);
 		listInput
 			.setValue(this.plugin.settings.filterList)
@@ -497,17 +513,5 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 			});
 		listInput.inputEl.rows = 6;
 		listInput.inputEl.setCssProps({ width: "100%", marginTop: "12px" });
-
-		new Setting(containerEl).addButton((btn) => {
-			applyButton = btn;
-			btn.setButtonText("保存列表并重新扫描")
-				.setDisabled(true)
-				.onClick(async () => {
-					await this.plugin.updateFilterList(listDraft);
-					await this.plugin.reapplyFilter();
-					new Notice("隐藏项过滤列表已应用");
-					refreshApplyState();
-				});
-		});
 	}
 }
