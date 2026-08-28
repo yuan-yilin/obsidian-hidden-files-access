@@ -5,6 +5,7 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TextAreaComponent,
 } from "obsidian";
 
 /* ── Type augmentations for internal Obsidian APIs ─────────── */
@@ -477,24 +478,25 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 			}
 		};
 
-		new Setting(containerEl)
+		// 指定项列表：文本框放在描述下方（info 列）占满整行宽度——
+		// Setting 默认的右侧控件列太窄，多行文本框会被挤成一条竖线。
+		const listSetting = new Setting(containerEl)
 			.setName("指定项列表")
 			.setDesc(
 				"每行一项：写名称（如 .git，匹配任意层级的同名项）或写路径" +
 					"（如 call-match-loop-engineering/.claude，匹配该路径及其内部所有内容）。" +
 					"仅显示模式下会自动放行列表条目的父级路径。" +
 					"Obsidian 配置目录与 .trash 回收站始终不会显示。",
-			)
-			.addTextArea((text) => {
-				text.setValue(this.plugin.settings.filterList).onChange(
-					(value) => {
-						listDraft = value;
-						refreshApplyState();
-					},
-				);
-				text.inputEl.rows = 6;
-				text.inputEl.setCssProps({ width: "100%" });
+			);
+		const listInput = new TextAreaComponent(listSetting.infoEl);
+		listInput
+			.setValue(this.plugin.settings.filterList)
+			.onChange((value) => {
+				listDraft = value;
+				refreshApplyState();
 			});
+		listInput.inputEl.rows = 6;
+		listInput.inputEl.setCssProps({ width: "100%", marginTop: "12px" });
 
 		new Setting(containerEl).addButton((btn) => {
 			applyButton = btn;
