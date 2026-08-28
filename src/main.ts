@@ -28,8 +28,21 @@ interface PrivateAdapter {
 	listRecursiveChild(parent: string, name: string): Promise<void>;
 	reconcileDeletion(realPath: string, path: string): Promise<void>;
 	reconcileFile?(e: string, t: string, silent?: boolean): Promise<void>;
+	reconcileFileCreation?(
+		realPath: string,
+		path: string,
+		stat: import("fs").Stats,
+	): Promise<void>;
 	reconcileFileInternal?(realPath: string, path: string): Promise<void>;
 	reconcileFolderCreation(realPath: string, path: string): Promise<void>;
+	reconcileSymbolicLinkCreation?(
+		realPath: string,
+		path: string,
+	): Promise<void>;
+	fsPromises: {
+		stat(path: string): Promise<import("fs").Stats>;
+		realpath(path: string): Promise<string>;
+	};
 }
 
 /* ── Settings ──────────────────────────────────────────────── */
@@ -40,6 +53,7 @@ type FilterMode = "all" | "whitelist" | "blacklist";
 interface ShowHiddenFilesSettings {
 	showAllFileTypes: boolean;
 	showHiddenFiles: boolean;
+	showSymlinks: boolean;
 	filterMode: FilterMode;
 	/** Raw filter list — one entry per line (name or vault-relative path). */
 	filterList: string;
@@ -48,6 +62,7 @@ interface ShowHiddenFilesSettings {
 const DEFAULT_SETTINGS: ShowHiddenFilesSettings = {
 	showAllFileTypes: true,
 	showHiddenFiles: true,
+	showSymlinks: true,
 	filterMode: "all",
 	filterList: "",
 };
@@ -110,8 +125,15 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 	private originalReconcileFile:
 		| PrivateAdapter["reconcileFile"]
 		| null = null;
+	private originalReconcileSymbolicLinkCreation:
+		| PrivateAdapter["reconcileSymbolicLinkCreation"]
+		| null = null;
 	private originalI18nT: ((...args: unknown[]) => string) | null = null;
 	private hiddenPaths = new Set<string>();
+	/** Symlinks we force-registered (paths), hidden again on disable/unload. */
+	private symlinkPaths = new Set<string>();
+	/** Realpaths of symlink targets already expanded this scan (loop/dup guard). */
+	private expandedSymlinkTargets = new Set<string>();
 	/** Parsed cache of settings.filterList, refreshed on load/save. */
 	private filterEntries: string[] = [];
 
@@ -195,10 +217,16 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		if (adapter.reconcileFile) {
 			this.originalReconcileFile = adapter.reconcileFile.bind(adapter);
 		}
+		if (adapter.reconcileSymbolicLinkCreation) {
+			this.originalReconcileSymbolicLinkCreation =
+				adapter.reconcileSymbolicLinkCreation.bind(adapter);
+		}
 
 		const origReconcileDeletion = this.originalReconcileDeletion;
 		const origListRecursiveChild = this.originalListRecursiveChild;
 		const origReconcileFile = this.originalReconcileFile;
+		const origReconcileSymbolicLinkCreation =
+			this.originalReconcileSymbolicLinkCreation;
 
 		adapter.reconcileDeletion = async (
 			realPath: string,
@@ -233,6 +261,58 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 				if (await this.maybeReveal(t)) return;
 				this.hiddenPaths.delete(t);
 				return origReconcileFile(e, t, silent);
+			};
+		}
+
+		// Symlink reveal: Obsidian's original handler skips any symlink whose
+		// target realpath is already covered by a watcher — i.e. every symlink
+		// pointing inside the vault (a recursive root watcher covers it all).
+		// When enabled, register the symlink ourselves: stat the target (this
+		// follows the link), then register as file/folder. reconcileFolderCreation
+		// cascades a listRecursive so the target's content is indexed under the
+		// symlink's path. A realpath visit set guards against symlink cycles and
+		// expanding the same target twice.
+		if (origReconcileSymbolicLinkCreation && adapter.reconcileFileCreation) {
+			adapter.reconcileSymbolicLinkCreation = async (
+				e: string,
+				t: string,
+			) => {
+				if (this.settings.showSymlinks) {
+					try {
+						const fullPath = adapter.getFullRealPath(e);
+						const targetStat = await adapter.fsPromises.stat(
+							fullPath,
+						);
+						if (targetStat.isFile()) {
+							await adapter.reconcileFileCreation!(
+								e,
+								t,
+								targetStat,
+							);
+							this.symlinkPaths.add(t);
+							return;
+						}
+						if (targetStat.isDirectory()) {
+							const real = await adapter.fsPromises.realpath(
+								fullPath,
+							);
+							if (this.expandedSymlinkTargets.has(real)) return;
+							this.expandedSymlinkTargets.add(real);
+							await adapter.reconcileFolderCreation(e, t);
+							this.symlinkPaths.add(t);
+							return;
+						}
+						return; // other special file types
+					} catch (err) {
+						if (
+							(err as { code?: string }).code === "ENOENT"
+						) {
+							return; // broken symlink — nothing to register
+						}
+						// unexpected error — fall through to the original
+					}
+				}
+				return origReconcileSymbolicLinkCreation(e, t);
 			};
 		}
 	}
@@ -270,20 +350,30 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 			if (this.originalReconcileFile) {
 				adapter.reconcileFile = this.originalReconcileFile;
 			}
+			if (this.originalReconcileSymbolicLinkCreation) {
+				adapter.reconcileSymbolicLinkCreation =
+					this.originalReconcileSymbolicLinkCreation;
+			}
 			this.originalReconcileDeletion = null;
 			this.originalListRecursiveChild = null;
 			this.originalReconcileFile = null;
+			this.originalReconcileSymbolicLinkCreation = null;
 
-			// Hide all files we previously revealed — deepest first so folders
-			// are emptied before they are removed.
-			const paths = [...this.hiddenPaths].sort(
-				(a, b) => b.length - a.length,
-			);
+			// Hide everything we revealed — deepest first so folders (whose
+			// deletion cascades to their subtree) are emptied before removal.
+			const paths = this.revealedPaths();
 			for (const path of paths) {
 				await adapter.reconcileDeletion(adapter.getRealPath(path), path);
 			}
 			this.hiddenPaths.clear();
+			this.symlinkPaths.clear();
 		}
+	}
+
+	/** Union of everything this plugin revealed, deepest path first. */
+	private revealedPaths(): string[] {
+		const all = new Set<string>([...this.hiddenPaths, ...this.symlinkPaths]);
+		return [...all].sort((a, b) => b.length - a.length);
 	}
 
 	/** Re-register a dotfile/dotfolder with the vault. */
@@ -310,6 +400,9 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 	/** Trigger a full vault rescan so all dotfiles hit our patched adapter methods. */
 	private async rescanVault(): Promise<void> {
 		const adapter = this.adapter();
+		// Fresh scan — forget which symlink targets were already expanded so
+		// they get re-revealed.
+		this.expandedSymlinkTargets.clear();
 		await adapter.listRecursive("");
 		// listRecursive("") only reconciles top-level entries — hidden folders
 		// nested under already-registered folders are never visited, so only
@@ -345,19 +438,20 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 
 	/** Disable hidden files — hide all revealed files + restore. */
 	async disableHiddenFiles(): Promise<void> {
-		// Hide all currently visible dotfiles — deepest first so folders are
-		// emptied before they are removed.
-		const paths = [...this.hiddenPaths].sort((a, b) => b.length - a.length);
+		// Hide everything we revealed (hidden paths + symlinks) — deepest
+		// first so folders are emptied before they are removed.
+		const paths = this.revealedPaths();
 		for (const path of paths) {
 			await this.hideFile(path);
 		}
 		this.hiddenPaths.clear();
+		this.symlinkPaths.clear();
 		await this.restoreAdapter();
 		this.restoreDotfileWarning();
 	}
 
-	/** Re-apply after a filter change — hide everything, rescan with new rules. */
-	async reapplyFilter(): Promise<void> {
+	/** Re-apply after settings change — hide everything, rescan with new rules. */
+	async reapply(): Promise<void> {
 		if (!this.settings.showHiddenFiles) return;
 		await this.disableHiddenFiles();
 		await this.enableHiddenFiles();
@@ -448,6 +542,24 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("显示符号链接（短链）")
+			.setDesc(
+				"显示指向 vault 内部的符号链接及其指向的内容" +
+					"（Obsidian 原生仅显示指向 vault 外部的符号链接）。" +
+					"指向同一目标的多个短链只会展开一次以避免循环。需开启「显示隐藏文件」。",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.showSymlinks)
+					.onChange(async (value) => {
+						this.plugin.settings.showSymlinks = value;
+						await this.plugin.saveSettings();
+						await this.plugin.reapply();
+						new Notice("符号链接显示设置已应用");
+					}),
+			);
+
+		new Setting(containerEl)
 			.setName("隐藏项过滤模式")
 			.setDesc(
 				"「显示全部」不做过滤；「仅显示指定项」只显示列表中的项（含其内部内容）；" +
@@ -463,7 +575,7 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 						await this.plugin.updateFilterMode(
 							value as FilterMode,
 						);
-						await this.plugin.reapplyFilter();
+						await this.plugin.reapply();
 						new Notice("隐藏项过滤模式已应用");
 					}),
 			);
@@ -497,7 +609,7 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 					.setDisabled(true)
 					.onClick(async () => {
 						await this.plugin.updateFilterList(listDraft);
-						await this.plugin.reapplyFilter();
+						await this.plugin.reapply();
 						new Notice("隐藏项过滤列表已应用");
 						refreshApplyState();
 					});

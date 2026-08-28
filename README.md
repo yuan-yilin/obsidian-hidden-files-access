@@ -40,6 +40,7 @@ witi42/obsidian-show-hidden-files
 |---------|---------|-------------|
 | 显示所有文件类型 (Show all file types) | On | Toggle unsupported file extensions in the explorer. Mirrors Obsidian's native "Detect all file extensions" option. |
 | 显示隐藏文件 (Show hidden files) | On | Toggle dotfiles and dotfolders in the explorer. `.obsidian` and `.trash` are always excluded. |
+| 显示符号链接 (Show symlinks) | On | Reveal symlinks pointing inside the vault and their target content (Obsidian only reveals symlinks pointing outside the vault natively). Multiple links to the same target are expanded once to avoid loops. |
 | 隐藏项过滤模式 (Filter mode) | 显示全部 | `显示全部` reveals everything hidden; `仅显示指定项` reveals only listed entries (and their contents); `仅排除指定项` hides listed entries (and their contents). |
 | 指定项列表 (Filter list) | empty | One entry per line. A bare name (`.git`) matches same-named items at any depth; a path (`folder/.claude`) matches that path's subtree. In 仅显示 mode, ancestors of listed entries are revealed automatically. |
 
