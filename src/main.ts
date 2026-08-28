@@ -1,4 +1,11 @@
-import { Plugin, PluginSettingTab, Setting, App } from "obsidian";
+import {
+	App,
+	ButtonComponent,
+	Notice,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+} from "obsidian";
 
 /* ── Type augmentations for internal Obsidian APIs ─────────── */
 
@@ -26,14 +33,22 @@ interface PrivateAdapter {
 
 /* ── Settings ──────────────────────────────────────────────── */
 
+/** How the filter list is applied to hidden paths. */
+type FilterMode = "all" | "whitelist" | "blacklist";
+
 interface ShowHiddenFilesSettings {
 	showAllFileTypes: boolean;
 	showHiddenFiles: boolean;
+	filterMode: FilterMode;
+	/** Raw filter list — one entry per line (name or vault-relative path). */
+	filterList: string;
 }
 
 const DEFAULT_SETTINGS: ShowHiddenFilesSettings = {
 	showAllFileTypes: true,
 	showHiddenFiles: true,
+	filterMode: "all",
+	filterList: "",
 };
 
 /** Obsidian internal directories that should never be exposed. */
@@ -45,6 +60,39 @@ function isHiddenPath(path: string, configDir: string): boolean {
 	return segments.some(
 		(s) => s.startsWith(".") && s !== configDir && !ALWAYS_EXCLUDED.has(s),
 	);
+}
+
+/**
+ * Entry matching on segment boundaries: a single-segment name (e.g. `.git`)
+ * matches same-named items at any depth; a multi-segment path matches that
+ * path's subtree (e.g. `a/.claude` matches `a/.claude/x`).
+ */
+function pathMatchesEntry(path: string, entry: string): boolean {
+	return ("/" + path + "/").includes("/" + entry + "/");
+}
+
+/**
+ * Filter decision for a hidden path. Whitelist mode also allows ancestors of
+ * listed entries (so a deep file entry can be reached through its parent
+ * chain); blacklist mode drops the entry's whole subtree.
+ */
+function isAllowedByFilter(
+	path: string,
+	mode: FilterMode,
+	entries: readonly string[],
+): boolean {
+	if (mode === "all") return true;
+	const matched = entries.some((e) => pathMatchesEntry(path, e));
+	if (mode === "blacklist") return !matched;
+	return matched || entries.some((e) => e.startsWith(path + "/"));
+}
+
+/** Parse the raw filter list text into clean entries. */
+function parseFilterList(raw: string): string[] {
+	return raw
+		.split("\n")
+		.map((line) => line.trim().replace(/^\/+|\/+$/g, ""))
+		.filter((line) => line.length > 0);
 }
 
 /* ── Plugin ────────────────────────────────────────────────── */
@@ -63,6 +111,8 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		| null = null;
 	private originalI18nT: ((...args: unknown[]) => string) | null = null;
 	private hiddenPaths = new Set<string>();
+	/** Parsed cache of settings.filterList, refreshed on load/save. */
+	private filterEntries: string[] = [];
 
 	async onload() {
 		await this.loadSettings();
@@ -98,10 +148,24 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 	async loadSettings() {
 		const loaded = (await this.loadData()) as Partial<ShowHiddenFilesSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+		this.filterEntries = parseFilterList(this.settings.filterList);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	/** Update the filter mode and persist it. */
+	async updateFilterMode(mode: FilterMode): Promise<void> {
+		this.settings.filterMode = mode;
+		await this.saveSettings();
+	}
+
+	/** Update the filter list (settings + parsed cache) and persist it. */
+	async updateFilterList(raw: string): Promise<void> {
+		this.settings.filterList = raw;
+		this.filterEntries = parseFilterList(raw);
+		await this.saveSettings();
 	}
 
 	/* ── show all file types ───────────────────────────────── */
@@ -177,6 +241,15 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		const adapter = this.adapter();
 		if (!this.settings.showHiddenFiles) return false;
 		if (!isHiddenPath(path, this.app.vault.configDir)) return false;
+		if (
+			!isAllowedByFilter(
+				path,
+				this.settings.filterMode,
+				this.filterEntries,
+			)
+		) {
+			return false;
+		}
 		const fullPath = adapter.getFullPath(path);
 		if (!(await adapter._exists(fullPath, path))) return false;
 		this.hiddenPaths.add(path);
@@ -246,6 +319,18 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		const { folders } = await adapter.list("");
 		for (const folder of folders) {
 			if (folder === configDir || ALWAYS_EXCLUDED.has(folder)) continue;
+			// Skip hidden top-level folders the filter rejects outright — no
+			// point walking (and reconciling) e.g. a blacklisted .git subtree.
+			if (
+				isHiddenPath(folder, configDir) &&
+				!isAllowedByFilter(
+					folder,
+					this.settings.filterMode,
+					this.filterEntries,
+				)
+			) {
+				continue;
+			}
 			await adapter.listRecursive(folder);
 		}
 	}
@@ -268,6 +353,13 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		this.hiddenPaths.clear();
 		await this.restoreAdapter();
 		this.restoreDotfileWarning();
+	}
+
+	/** Re-apply after a filter change — hide everything, rescan with new rules. */
+	async reapplyFilter(): Promise<void> {
+		if (!this.settings.showHiddenFiles) return;
+		await this.disableHiddenFiles();
+		await this.enableHiddenFiles();
 	}
 
 	/* ── suppress the "bad dotfile" warning ────────────────── */
@@ -317,10 +409,10 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName("Show all file types")
+			.setName("显示所有文件类型")
 			.setDesc(
-				"Show files with unsupported extensions in the file explorer. " +
-					'Synced with Obsidian\'s native "Detect all file extensions" setting.',
+				"在文件列表中显示 Obsidian 默认不支持扩展名的文件（如 .json、.yml）。" +
+					"与 Obsidian 原生设置「检测所有文件扩展名」联动。",
 			)
 			.addToggle((toggle) => {
 				const current =
@@ -335,9 +427,10 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Show hidden files")
+			.setName("显示隐藏文件")
 			.setDesc(
-				"Show files and folders whose names start with a dot (e.g. .gitignore, .env).",
+				"显示以点（.）开头的文件和文件夹（如 .gitignore、.env）。" +
+					"关闭后，下方过滤规则同样不生效。",
 			)
 			.addToggle((toggle) =>
 				toggle
@@ -352,5 +445,67 @@ class ShowHiddenFilesSettingTab extends PluginSettingTab {
 						}
 					}),
 			);
+
+		new Setting(containerEl)
+			.setName("隐藏项过滤模式")
+			.setDesc(
+				"「显示全部」不做过滤；「仅显示指定项」只显示列表中的项（含其内部内容）；" +
+					"「仅排除指定项」不显示列表中的项（含其内部内容）。变更后立即生效。",
+			)
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("all", "显示全部（默认）")
+					.addOption("whitelist", "仅显示指定项")
+					.addOption("blacklist", "仅排除指定项")
+					.setValue(this.plugin.settings.filterMode)
+					.onChange(async (value) => {
+						await this.plugin.updateFilterMode(
+							value as FilterMode,
+						);
+						await this.plugin.reapplyFilter();
+						new Notice("隐藏项过滤模式已应用");
+					}),
+			);
+
+		let listDraft = this.plugin.settings.filterList;
+		let applyButton: ButtonComponent | null = null;
+		const refreshApplyState = () => {
+			if (applyButton) {
+				applyButton.setDisabled(
+					listDraft === this.plugin.settings.filterList,
+				);
+			}
+		};
+
+		new Setting(containerEl)
+			.setName("指定项列表")
+			.setDesc(
+				"每行一项：写名称（如 .git，匹配任意层级的同名项）或写路径" +
+					"（如 call-match-loop-engineering/.claude，匹配该路径及其内部所有内容）。" +
+					"仅显示模式下会自动放行列表条目的父级路径。" +
+					"Obsidian 配置目录与 .trash 回收站始终不会显示。",
+			)
+			.addTextArea((text) => {
+				text.setValue(this.plugin.settings.filterList).onChange(
+					(value) => {
+						listDraft = value;
+						refreshApplyState();
+					},
+				);
+				text.inputEl.rows = 6;
+				text.inputEl.setCssProps({ width: "100%" });
+			});
+
+		new Setting(containerEl).addButton((btn) => {
+			applyButton = btn;
+			btn.setButtonText("保存列表并重新扫描")
+				.setDisabled(true)
+				.onClick(async () => {
+					await this.plugin.updateFilterList(listDraft);
+					await this.plugin.reapplyFilter();
+					new Notice("隐藏项过滤列表已应用");
+					refreshApplyState();
+				});
+		});
 	}
 }
