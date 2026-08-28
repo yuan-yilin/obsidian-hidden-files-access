@@ -1,0 +1,14 @@
+/* 短链（符号链接）条目标记 — 斜体 + 灰色 + ↗ 后缀，与普通文件/文件夹区分 */
+.nav-file-title.shf-symlink,
+.nav-folder-title.shf-symlink {
+	color: var(--text-muted);
+	font-style: italic;
+}
+.nav-file-title.shf-symlink .nav-file-title-content::after,
+.nav-folder-title.shf-symlink .nav-folder-title-content::after {
+	content: "↗";
+	margin-left: 0.3em;
+	color: var(--text-faint);
+	font-style: normal;
+	font-weight: normal;
+}

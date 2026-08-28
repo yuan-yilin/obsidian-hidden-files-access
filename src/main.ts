@@ -136,6 +136,8 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 	private expandedSymlinkTargets = new Set<string>();
 	/** Parsed cache of settings.filterList, refreshed on load/save. */
 	private filterEntries: string[] = [];
+	/** Observers marking rendered explorer items that are symlinks. */
+	private symlinkObservers: MutationObserver[] = [];
 
 	async onload() {
 		await this.loadSettings();
@@ -151,7 +153,24 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 				this.patchAdapter();
 				this.suppressDotfileWarning();
 				await this.rescanVault();
+				this.refreshSymlinkObservers();
 			}
+		});
+
+		// New/explorer panes and layout changes — re-attach observers so
+		// lazily rendered symlink items always get marked.
+		this.registerEvent(
+			this.app.workspace.on("layout-change", () => {
+				if (this.originalReconcileDeletion) {
+					this.refreshSymlinkObservers();
+				}
+			}),
+		);
+
+		this.register(() => {
+			for (const observer of this.symlinkObservers) observer.disconnect();
+			this.symlinkObservers = [];
+			this.clearSymlinkDecorations();
 		});
 
 		this.addSettingTab(new ShowHiddenFilesSettingTab(this.app, this));
@@ -434,6 +453,7 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		this.patchAdapter();
 		this.suppressDotfileWarning();
 		await this.rescanVault();
+		this.decorateSymlinks();
 	}
 
 	/** Disable hidden files — hide all revealed files + restore. */
@@ -446,6 +466,7 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		}
 		this.hiddenPaths.clear();
 		this.symlinkPaths.clear();
+		this.clearSymlinkDecorations();
 		await this.restoreAdapter();
 		this.restoreDotfileWarning();
 	}
@@ -455,6 +476,65 @@ export default class ShowHiddenFilesPlugin extends Plugin {
 		if (!this.settings.showHiddenFiles) return;
 		await this.disableHiddenFiles();
 		await this.enableHiddenFiles();
+	}
+
+	/* ── symlink decoration (file explorer) ───────────────── */
+
+	/** Marker styles live in styles.css (loaded by Obsidian automatically). */
+
+	private explorerViews(): { containerEl: HTMLElement }[] {
+		return (
+			this.app.workspace
+				.getLeavesOfType("file-explorer")
+				.map(
+					(leaf) =>
+						leaf.view as unknown as { containerEl: HTMLElement },
+				)
+				.filter((view) => view && view.containerEl) ?? []
+		);
+	}
+
+	/** Mark rendered explorer items whose path is a revealed symlink. */
+	private decorateSymlinks(): void {
+		for (const view of this.explorerViews()) {
+			view.containerEl
+				.querySelectorAll<HTMLElement>("[data-path]")
+				.forEach((el) => {
+					const path = el.getAttribute("data-path");
+					if (path && this.symlinkPaths.has(path)) {
+						el.classList.add("shf-symlink");
+					}
+				});
+		}
+	}
+
+	/** Remove the symlink marker from all explorer items. */
+	private clearSymlinkDecorations(): void {
+		for (const view of this.explorerViews()) {
+			view.containerEl
+				.querySelectorAll(".shf-symlink")
+				.forEach((el) => el.classList.remove("shf-symlink"));
+		}
+	}
+
+	/** (Re)attach observers to explorer containers and decorate once. The
+	 *  explorer renders collapsed folders lazily, so items appearing later
+	 *  (folder expansion, renames) need marking as they show up. */
+	private refreshSymlinkObservers(): void {
+		for (const observer of this.symlinkObservers) observer.disconnect();
+		this.symlinkObservers = [];
+		for (const view of this.explorerViews()) {
+			const observer = new MutationObserver(() => {
+				// setTimeout, never rAF — background windows don't fire rAF.
+				window.setTimeout(() => this.decorateSymlinks(), 0);
+			});
+			observer.observe(view.containerEl, {
+				childList: true,
+				subtree: true,
+			});
+			this.symlinkObservers.push(observer);
+		}
+		this.decorateSymlinks();
 	}
 
 	/* ── suppress the "bad dotfile" warning ────────────────── */
